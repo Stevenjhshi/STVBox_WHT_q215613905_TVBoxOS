@@ -11,7 +11,7 @@ android {
         applicationId 'com.stvbox.app'
         targetSdkVersion 28
         versionCode 1
-        versionName '1.0.0'
+        versionName 'STVBox_WHT_" + buildTime() + "_armeabi-v7a-java32'
         multiDexEnabled true
         resValue "string", "about_version_name", "STVBox_WHT_" + buildTime()
 
