@@ -47,9 +47,7 @@ jobs:
             # 目前关于页面没有合并我的分支
             sed -i "/android:text=/s#=\"#=\"${{ env.tag }}\\\\n\\\\n#" app/src/main/res/layout/dialog_about.xml
           else
-             # 注释掉强制覆盖，使用 build.gradle 中的动态 versionName
-             # 使用我们自己在 build.gradle 中动态生成的 STVBox_WHT_... 版本号
-             echo "已跳过对 versionName 和 dialog_about.xml 的强制覆盖"
+             sed -i "/android:text=/s#=\"#=\"STVBox_WHT_${{ env.formatted_tag }}_armeabi-v7a-java32\\\\n\\\\n#" app/src/main/res/layout/dialog_about.xml
           fi 
           echo 'crosswalk源，防挂'
           if grep -q 'crosswalk' build.gradle; then
