@@ -48,8 +48,8 @@ jobs:
             sed -i "/android:text=/s#=\"#=\"${{ env.tag }}\\\\n\\\\n#" app/src/main/res/layout/dialog_about.xml
           else
              # 注释掉强制覆盖，使用 build.gradle 中的动态 versionName
-             # sed -i "/versionName/s#[0-9a-zA-Z_\.\'\"-]\+\$#\'${{ env.tag }}\'#" app/build.gradle
-             # sed -i "/android:text=/s#=\"#=\"${{ env.tag }}\\\\n\\\\n#" app/src/main/res/layout/dialog_about.xml
+             # 使用我们自己在 build.gradle 中动态生成的 STVBox_WHT_... 版本号
+             echo "已跳过对 versionName 和 dialog_about.xml 的强制覆盖"
           fi 
           echo 'crosswalk源，防挂'
           if grep -q 'crosswalk' build.gradle; then
