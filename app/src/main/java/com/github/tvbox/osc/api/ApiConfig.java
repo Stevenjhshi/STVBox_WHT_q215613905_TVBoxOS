@@ -73,7 +73,7 @@ import java.util.regex.Pattern;
  * @description:
  */
 public class ApiConfig {
-    private static ApiConfig instance;
+    private static volatile ApiConfig instance;
     private final LinkedHashMap<String, SourceBean> sourceBeanList;
     private SourceBean mHomeSource;
     private ParseBean mDefaultParse;
@@ -86,7 +86,10 @@ public class ApiConfig {
     private String currentPyKey = "";
     private String currentLivePyKey = "";
     private String currentPlaySourceKey = "";
-    private String loadedLiveConfigUrl = "";
+    private volatile String loadedLiveConfigUrl = "";
+    // 直播播放中标记：CSP 初始化（尤其 python 的 synchronized getSpider）优先给直播，
+    // 避免后台预热在直播加载时抢占爬虫锁，造成直播列表明显变慢
+    public static volatile boolean livePlaybackActive = false;
     public String wallpaper = "";
     private String danmaku = "";
 
@@ -97,10 +100,14 @@ public class ApiConfig {
     private final IPyLoader pyLoader =  new pyLoader();
     private final Gson gson;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private final ExecutorService configLoadExecutor = Executors.newSingleThreadExecutor();
+    // 配置拉取/解析与爬虫预热相互独立，避免预热把直播配置加载堵在队列里
+    private final ExecutorService configLoadExecutor = Executors.newFixedThreadPool(3);
+    private final ExecutorService warmSearchExecutor = Executors.newSingleThreadExecutor();
     private final ExecutorService jarLoadExecutor = Executors.newSingleThreadExecutor();
     private final ExecutorService danmuSearchExecutor = Executors.newSingleThreadExecutor();
     private final Set<String> warmedSearchSpiderKeys = new HashSet<>();
+    // 配置解析会重建共享集合，跨线程时必须串行，避免直播配置与主配置互相破坏
+    private final Object configParseLock = new Object();
 
     private final String userAgent = "okhttp/3.15";
 
@@ -166,14 +173,24 @@ public class ApiConfig {
         return "".getBytes();
     }
 
-    private String TempKey = null;
-    private String configUrl(String apiUrl){
-        TempKey = null;
+    /** 配置地址与解密 key，避免用成员变量 TempKey 在并发调用时串值 */
+    private static final class ConfigTarget {
+        final String url;
+        final String key;
+
+        ConfigTarget(String url, String key) {
+            this.url = url;
+            this.key = key;
+        }
+    }
+
+    private ConfigTarget resolveConfigUrl(String apiUrl){
+        String key = null;
         String configUrl = "", pk = ";pk;";
         apiUrl=apiUrl.replace("file://", "clan://localhost/");
         if (apiUrl.contains(pk)) {
             String[] a = apiUrl.split(pk);
-            TempKey = a[1];
+            key = a[1];
             if (apiUrl.startsWith("clan")){
                 configUrl = clanToAddress(a[0]);
             }else if (apiUrl.startsWith("http")){
@@ -188,72 +205,128 @@ public class ApiConfig {
         } else {
             configUrl = apiUrl;
         }
-        return configUrl;
+        return new ConfigTarget(configUrl, key);
     }
     public void loadConfig(boolean useCache, LoadConfigCallback callback, Activity activity) {
-        String apiUrl = Hawk.get(HawkConfig.API_URL, "");
+        final String apiUrl = Hawk.get(HawkConfig.API_URL, "");
         if (apiUrl.isEmpty()) {
             callback.error("-1");
             return;
         }
-        File cache = new File(App.getInstance().getFilesDir().getAbsolutePath() + "/" + MD5.encode(apiUrl));
-        if (useCache && cache.exists()) {
-            try {
-                String json = readConfigFile(cache);
-                if (switchApiCollectionIfNeeded(apiUrl, json)) {
-                    loadConfig(false, callback, activity);
-                    return;
+        final ConfigTarget target = resolveConfigUrl(apiUrl);
+        final File cache = new File(App.getInstance().getFilesDir().getAbsolutePath() + "/" + MD5.encode(apiUrl));
+        // 有本地缓存先秒出配置，网络只做后台刷新，解决启动首屏被网络阻塞的问题
+        if (cache.exists() && cache.length() > 0) {
+            configLoadExecutor.execute(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        String json = readConfigFile(cache);
+                        if (TextUtils.isEmpty(json)) throw new IOException("empty config cache");
+                        if (applyConfig(apiUrl, json)) {
+                            loadConfig(false, callback, activity);
+                            return;
+                        }
+                        mainHandler.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                callback.success();
+                            }
+                        });
+                        if (!useCache) refreshConfigCache(apiUrl, target, cache);
+                    } catch (Throwable th) {
+                        th.printStackTrace();
+                        fetchConfig(apiUrl, target, cache, callback, activity);
+                    }
                 }
-                clearApiLinesIfUnmatched(apiUrl);
-                parseJson(apiUrl, json);
-                callback.success();
-                return;
-            } catch (Throwable th) {
-                th.printStackTrace();
-            }
+            });
+            return;
         }
-        String configUrl=configUrl(apiUrl);
+        fetchConfig(apiUrl, target, cache, callback, activity);
+    }
 
-        final String configKey = TempKey;
+    /**
+     * 在后台线程解析主配置。
+     *
+     * @return true 表示这是多线路合集并已切换线路，需要重新加载
+     */
+    private boolean applyConfig(String apiUrl, String json) {
+        synchronized (configParseLock) {
+            if (switchApiCollectionIfNeeded(apiUrl, json)) return true;
+            clearApiLinesIfUnmatched(apiUrl);
+            parseJson(apiUrl, json);
+            return false;
+        }
+    }
 
-        fetchConfigAsync(apiUrl, configUrl, configKey, new ConfigFetchCallback() {
+    /** 缓存直出后再静默刷新缓存文件，仅用于下次启动，不打断当前界面 */
+    private void refreshConfigCache(String apiUrl, ConfigTarget target, final File cache) {
+        fetchConfigAsync(apiUrl, target.url, target.key, new ConfigFetchCallback() {
             @Override
             public void success(String json) {
-                try {
-//                            LOG.longI("echo-ConfigJson", json);
-                    if (switchApiCollectionIfNeeded(apiUrl, json)) {
-                        FileUtils.saveCache(cache,json);
-                        loadConfig(false, callback, activity);
-                        return;
-                    }
-                    clearApiLinesIfUnmatched(apiUrl);
-                    parseJson(apiUrl, json);
-                    FileUtils.saveCache(cache,json);
-                    callback.success();
-                } catch (Throwable th) {
-                    th.printStackTrace();
-                    callback.error("配置解析失败");
-                }
+                if (!TextUtils.isEmpty(json)) FileUtils.saveCache(cache, json);
             }
 
             @Override
             public void error(String error) {
+            }
+        });
+    }
+
+    private void fetchConfig(final String apiUrl, final ConfigTarget target, final File cache, final LoadConfigCallback callback, final Activity activity) {
+        fetchConfigAsync(apiUrl, target.url, target.key, new ConfigFetchCallback() {
+            @Override
+            public void success(String json) {
+                try {
+                    boolean switched = applyConfig(apiUrl, json);
+                    FileUtils.saveCache(cache, json);
+                    if (switched) {
+                        loadConfig(false, callback, activity);
+                        return;
+                    }
+                    mainHandler.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            callback.success();
+                        }
+                    });
+                } catch (Throwable th) {
+                    th.printStackTrace();
+                    mainHandler.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            callback.error("配置解析失败");
+                        }
+                    });
+                }
+            }
+
+            @Override
+            public void error(final String error) {
                 if (cache.exists()) {
                     try {
                         String json = readConfigFile(cache);
-                        if (switchApiCollectionIfNeeded(apiUrl, json)) {
+                        if (applyConfig(apiUrl, json)) {
                             loadConfig(false, callback, activity);
                             return;
                         }
-                        clearApiLinesIfUnmatched(apiUrl);
-                        parseJson(apiUrl, json);
-                        callback.success();
+                        mainHandler.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                callback.success();
+                            }
+                        });
                         return;
                     } catch (Throwable th) {
                         th.printStackTrace();
                     }
                 }
-                callback.error("拉取配置失败\n" + error);
+                mainHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        callback.error("拉取配置失败\n" + error);
+                    }
+                });
             }
         });
     }
@@ -268,37 +341,71 @@ public class ApiConfig {
             return;
         }
         final String liveApiUrl = apiUrl;
-        String liveApiConfigUrl = configUrl(liveApiUrl);
-        final String liveConfigKey = TempKey;
-        File live_cache = new File(App.getInstance().getFilesDir().getAbsolutePath() + "/" + MD5.encode(liveApiUrl));
+        final ConfigTarget target = resolveConfigUrl(liveApiUrl);
+        final File live_cache = new File(App.getInstance().getFilesDir().getAbsolutePath() + "/" + MD5.encode(liveApiUrl));
         LOG.i("echo-load live config "+liveApiUrl);
         if (useCache && live_cache.exists()) {
-            try {
-                parseLiveConfigContent(liveApiUrl, live_cache);
-                if (hasLiveConfigResult()) {
-                    loadedLiveConfigUrl = liveApiUrl;
-                    callback.success();
-                    return;
+            configLoadExecutor.execute(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        synchronized (configParseLock) {
+                            parseLiveConfigContent(liveApiUrl, live_cache);
+                        }
+                        if (hasLiveConfigResult()) {
+                            loadedLiveConfigUrl = liveApiUrl;
+                            mainHandler.post(new Runnable() {
+                                @Override
+                                public void run() {
+                                    callback.success();
+                                }
+                            });
+                            return;
+                        }
+                    } catch (Throwable th) {
+                        th.printStackTrace();
+                    }
+                    fetchLiveConfig(liveApiUrl, target, live_cache, callback);
                 }
-            } catch (Throwable th) {
-                th.printStackTrace();
-            }
+            });
+            return;
         }
-        fetchConfigAsync(liveApiUrl, liveApiConfigUrl, liveConfigKey, new ConfigFetchCallback() {
+        fetchLiveConfig(liveApiUrl, target, live_cache, callback);
+    }
+
+    private void fetchLiveConfig(final String liveApiUrl, final ConfigTarget target, final File live_cache, final LoadConfigCallback callback) {
+        fetchConfigAsync(liveApiUrl, target.url, target.key, new ConfigFetchCallback() {
             @Override
             public void success(String json) {
                 try {
-                    parseLiveConfigContent(liveApiUrl, json);
+                    synchronized (configParseLock) {
+                        parseLiveConfigContent(liveApiUrl, json);
+                    }
                     if (!hasLiveConfigResult()) {
-                        callback.error("直播配置解析失败");
+                        mainHandler.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                callback.error("直播配置解析失败");
+                            }
+                        });
                         return;
                     }
                     loadedLiveConfigUrl = liveApiUrl;
                     FileUtils.saveCache(live_cache, json);
-                    callback.success();
+                    mainHandler.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            callback.success();
+                        }
+                    });
                 } catch (Throwable th) {
                     th.printStackTrace();
-                    callback.error("直播配置解析失败");
+                    mainHandler.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            callback.error("直播配置解析失败");
+                        }
+                    });
                 }
             }
 
@@ -306,17 +413,29 @@ public class ApiConfig {
             public void error(String error) {
                 if (live_cache.exists()) {
                     try {
-                        parseLiveConfigContent(liveApiUrl, live_cache);
+                        synchronized (configParseLock) {
+                            parseLiveConfigContent(liveApiUrl, live_cache);
+                        }
                         if (hasLiveConfigResult()) {
                             loadedLiveConfigUrl = liveApiUrl;
-                            callback.success();
+                            mainHandler.post(new Runnable() {
+                                @Override
+                                public void run() {
+                                    callback.success();
+                                }
+                            });
                             return;
                         }
                     } catch (Throwable th) {
                         th.printStackTrace();
                     }
                 }
-                callback.error("直播配置拉取失败");
+                mainHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        callback.error("直播配置拉取失败");
+                    }
+                });
             }
         });
     }
@@ -400,16 +519,12 @@ public class ApiConfig {
                 }
                 final String finalResult = result;
                 final String finalError = error;
-                mainHandler.post(new Runnable() {
-                    @Override
-                    public void run() {
-                        if (TextUtils.isEmpty(finalError)) {
-                            callback.success(finalResult);
-                        } else {
-                            callback.error(finalError);
-                        }
-                    }
-                });
+                // 仍在后台线程回调：解析/落盘都不占主线程，回调方负责把 UI 更新 post 回主线程
+                if (TextUtils.isEmpty(finalError)) {
+                    callback.success(finalResult);
+                } else {
+                    callback.error(finalError);
+                }
             }
         });
     }
@@ -525,61 +640,62 @@ public class ApiConfig {
         }
     }
 
-    private void loadJar(boolean useCache, String spider, LoadConfigCallback callback, int retryCount) {
+    private void loadJar(boolean useCache, String spider, final LoadConfigCallback callback, final int retryCount) {
         String[] urls = spider.split(";md5;");
-        String jarUrl = urls[0];
-        String md5 = urls.length > 1 ? urls[1].trim() : "";
-        File cache = new File(App.getInstance().getFilesDir().getAbsolutePath() + "/csp/"+MD5.string2MD5(jarUrl)+".jar");
-
-        if (!md5.isEmpty() || useCache) {
-            if (cache.exists() && (useCache || MD5.getFileMd5(cache).equalsIgnoreCase(md5))) {
-                if (cache.exists()) {
-                    loadJarAsync(cache, new JarLoadCallback() {
-                        @Override
-                        public void complete(boolean success) {
-                            if (success) {
-                                callback.success();
+        final String jarUrl = urls[0];
+        final String md5 = urls.length > 1 ? urls[1].trim() : "";
+        final String spiderConfig = spider;
+        final File cache = new File(App.getInstance().getFilesDir().getAbsolutePath() + "/csp/" + MD5.string2MD5(jarUrl) + ".jar");
+        // MD5 校验要整文件读取、dex/jar 加载也会阻塞，统一放到后台，避免启动时卡住主线程
+        jarLoadExecutor.execute(new Runnable() {
+            @Override
+            public void run() {
+                if (!md5.isEmpty() || useCache) {
+                    if (cache.exists()) {
+                        String cacheMd5 = MD5.getFileMd5(cache);
+                        if (useCache || (cacheMd5 != null && cacheMd5.equalsIgnoreCase(md5))) {
+                            if (jarLoader.load(cache.getAbsolutePath())) {
+                                postJarResult(callback, true, null);
                             } else {
-                                callback.error("md5缓存失效");
+                                postJarResult(callback, false, "md5缓存失效");
                             }
+                            return;
                         }
-                    });
-                    return;
+                    }
+                } else if (Boolean.parseBoolean(jarCache) && cache.exists() && !FileUtils.isWeekAgo(cache)) {
+                    LOG.i("echo-load jar jarCache:" + jarUrl);
+                    if (jarLoader.load(cache.getAbsolutePath())) {
+                        postJarResult(callback, true, null);
+                        return;
+                    }
+                    // 缓存损坏：直接换新包，避免对同一份坏包原地无限重试
+                    if (cache.exists() && !cache.delete()) {
+                        LOG.i("echo---delete bad jar cache failed:" + cache.getAbsolutePath());
+                    }
                 }
-                if (jarLoader.load(cache.getAbsolutePath())) {
+                downloadJar(jarUrl, spiderConfig, cache, callback, retryCount);
+            }
+        });
+    }
+
+    private void postJarResult(final LoadConfigCallback callback, final boolean success, final String error) {
+        mainHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                if (success) {
                     callback.success();
                 } else {
-                    callback.error("md5缓存失效");
-                }
-                return;
-            }
-        }else {
-            if (Boolean.parseBoolean(jarCache) && cache.exists() && !FileUtils.isWeekAgo(cache)) {
-                LOG.i("echo-load jar jarCache:"+jarUrl);
-                if (cache.exists()) {
-                    loadJarAsync(cache, new JarLoadCallback() {
-                        @Override
-                        public void complete(boolean success) {
-                            if (success) {
-                                callback.success();
-                            } else {
-                                loadJar(false, spider, callback, retryCount);
-                            }
-                        }
-                    });
-                    return;
-                }
-                if (jarLoader.load(cache.getAbsolutePath())) {
-                    callback.success();
-                    return;
+                    callback.error(error);
                 }
             }
-        }
+        });
+    }
 
+    private void downloadJar(final String jarUrl, final String spider, final File cache,
+                             final LoadConfigCallback callback, final int retryCount) {
         boolean isJarInImg = jarUrl.startsWith("img+");
-        jarUrl = jarUrl.replace("img+", "");
-        LOG.i("echo-load jar start:"+jarUrl);
-        final String requestUrl = jarUrl;
+        final String requestUrl = jarUrl.replace("img+", "");
+        LOG.i("echo-load jar start:" + requestUrl);
         downloadJarAsync(requestUrl, isJarInImg, cache, new JarDownloadCallback() {
             private boolean retryLoad(String reason) {
                 if (retryCount >= LOAD_JAR_MAX_RETRY) return false;
@@ -637,13 +753,13 @@ public class ApiConfig {
     }
 
     private String readConfigFile(File f) throws Throwable {
-        BufferedReader bReader = new BufferedReader(new InputStreamReader(new FileInputStream(f), "UTF-8"));
         StringBuilder sb = new StringBuilder();
-        String s = "";
-        while ((s = bReader.readLine()) != null) {
-            sb.append(s + "\n");
+        try (BufferedReader bReader = new BufferedReader(new InputStreamReader(new FileInputStream(f), "UTF-8"))) {
+            String s;
+            while ((s = bReader.readLine()) != null) {
+                sb.append(s).append('\n');
+            }
         }
-        bReader.close();
         return sb.toString();
     }
 
@@ -742,6 +858,12 @@ public class ApiConfig {
     private void parseJson(String apiUrl, String jsonStr) {
         resetConfigData();
         JsonObject infoJson = gson.fromJson(jsonStr, JsonObject.class);
+        if (infoJson == null) {
+            throw new IllegalArgumentException("配置文件为空");
+        }
+        if (!infoJson.has("sites") || !infoJson.get("sites").isJsonArray()) {
+            throw new IllegalArgumentException("配置文件缺少 sites");
+        }
         // spider
         spider = DefaultConfig.safeJsonString(infoJson, "spider", "");
         jarCache = DefaultConfig.safeJsonString(infoJson, "jarCache", "true");
@@ -1079,11 +1201,14 @@ public class ApiConfig {
     private void parseLiveJson(String apiUrl, String jsonStr) {
         liveChannelGroupList.clear();
         JsonObject infoJson = gson.fromJson(jsonStr, JsonObject.class);
+        if (infoJson == null) {
+            throw new IllegalArgumentException("直播配置为空");
+        }
         // spider
         liveSpider = DefaultConfig.safeJsonString(infoJson, "spider", "");
         // 直播源
         initLiveSettings();
-        if(infoJson.has("lives")){
+        if(infoJson.has("lives") && infoJson.get("lives").isJsonArray()){
             JsonArray lives_groups=infoJson.get("lives").getAsJsonArray();
 
             int live_group_index=getLiveGroupIndex();
@@ -1196,6 +1321,8 @@ public class ApiConfig {
             else
                 liveChannelGroup.setGroupPassword("");
             channelIndex = 0;
+            // 同名频道合并走哈希索引，避免大列表下的 O(n^2) 遍历
+            HashMap<String, LiveChannelItem> channelNameIndex = new HashMap<>();
             for (JsonElement channelElement : ((JsonObject) groupElement).get("channels").getAsJsonArray()) {
                 JsonObject obj = (JsonObject) channelElement;
                 LiveChannelItem liveChannelItem = new LiveChannelItem();
@@ -1249,30 +1376,18 @@ public class ApiConfig {
                 }
                 liveChannelItem.setChannelSourceNames(sourceNames);
                 liveChannelItem.setChannelUrls(sourceUrls);
-                if (mergeLiveChannel(liveChannelGroup.getLiveChannels(), liveChannelItem)) {
+                LiveChannelItem oldItem = channelNameIndex.get(liveChannelItem.getChannelName());
+                if (oldItem == null) {
+                    liveChannelGroup.getLiveChannels().add(liveChannelItem);
+                    channelNameIndex.put(liveChannelItem.getChannelName(), liveChannelItem);
                     liveChannelItem.setChannelIndex(channelIndex++);
                     liveChannelItem.setChannelNum(++channelNum);
+                } else {
+                    mergeLiveChannelUrls(oldItem, liveChannelItem);
                 }
             }
             liveChannelGroupList.add(liveChannelGroup);
         }
-    }
-
-    private boolean mergeLiveChannel(ArrayList<LiveChannelItem> channelItems, LiveChannelItem newItem) {
-        LiveChannelItem oldItem = findLiveChannel(channelItems, newItem.getChannelName());
-        if (oldItem == null) {
-            channelItems.add(newItem);
-            return true;
-        }
-        mergeLiveChannelUrls(oldItem, newItem);
-        return false;
-    }
-
-    private LiveChannelItem findLiveChannel(ArrayList<LiveChannelItem> channelItems, String channelName) {
-        for (LiveChannelItem item : channelItems) {
-            if (channelName != null && channelName.equals(item.getChannelName())) return item;
-        }
-        return null;
     }
 
     private void mergeLiveChannelUrls(LiveChannelItem oldItem, LiveChannelItem newItem) {
@@ -1479,12 +1594,21 @@ public class ApiConfig {
             String spiderApiKey = source.getJar() + "|" + source.getApi();
             if (!spiderApis.add(spiderApiKey)) sharedSpiderApis.add(spiderApiKey);
         }
-        configLoadExecutor.execute(new Runnable() {
+        warmSearchExecutor.execute(new Runnable() {
             @Override
             public void run() {
+                // 让出启动/进直播的关键路径：预热纯属后台加速，晚一点不影响可用性
+                try {
+                    Thread.sleep(3000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
                 LOG.i("echo-warm-spider start");
                 int eligibleCount = 0;
                 for (SourceBean source : sources) {
+                    // 直播正在加载时立即停止预热，避免 JsLoader/pyLoader 的锁与直播 CSP 争抢
+                    if (livePlaybackActive) break;
                     if (source == null || source.getType() != 3 || !source.isSearchable()) continue;
                     if (home != null && TextUtils.equals(home.getKey(), source.getKey())) continue;
                     // 同类 Spider 可能通过静态状态保存 ext，不能在后台预热时交替初始化。

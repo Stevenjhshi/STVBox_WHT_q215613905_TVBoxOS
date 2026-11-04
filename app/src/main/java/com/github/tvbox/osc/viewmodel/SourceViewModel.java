@@ -109,6 +109,8 @@ public class SourceViewModel extends ViewModel {
 
     public static final ExecutorService spThreadPool = Executors.newSingleThreadExecutor();
     private static final ExecutorService httpPrepareThreadPool = Executors.newFixedThreadPool(3);
+    // 复用线程执行带超时的爬虫调用，避免每次请求都新建/销毁线程
+    private static final ExecutorService spiderCallPool = Executors.newFixedThreadPool(4);
 
     //homeContent缓存，最多存储5个sourceKey的AbsSortXml对象
     private static final Map<String, AbsSortXml> sortCache = new LinkedHashMap<String, AbsSortXml>(5, 0.75f, true) {
@@ -231,7 +233,7 @@ public class SourceViewModel extends ViewModel {
             Runnable waitResponse = new Runnable() {
                 @Override
                 public void run() {
-                    ExecutorService executor = Executors.newSingleThreadExecutor();
+                    ExecutorService executor = spiderCallPool;
                     Future<String> future = executor.submit(new Callable<String>() {
                         @Override
                         public String call() throws Exception {
@@ -278,11 +280,6 @@ public class SourceViewModel extends ViewModel {
                             }
                         } else {
                             postSortResult(sourceKey, null);
-                        }
-                        try {
-                            executor.shutdown();
-                        } catch (Throwable th) {
-                            th.printStackTrace();
                         }
                     }
                 }
@@ -449,7 +446,7 @@ public class SourceViewModel extends ViewModel {
             spThreadPool.execute(new Runnable() {
                 @Override
                 public void run() {
-                    ExecutorService executor = Executors.newSingleThreadExecutor();
+                    ExecutorService executor = spiderCallPool;
                     Future<String> future = executor.submit(new Callable<String>() {
                         @Override
                         public String call() throws Exception {
@@ -470,7 +467,6 @@ public class SourceViewModel extends ViewModel {
                         LOG.i("echo--getList-error--" + homeSourceBean.getKey() + "--" + e.getClass().getSimpleName() + "--" + (cause != null ? cause.getClass().getSimpleName() + ":" + cause.getMessage() : e.getMessage()));
                         e.printStackTrace();
                     } finally {
-                        executor.shutdown();
                         if (json != null) {
                             json(listResult, json,homeSourceBean.getKey());
                         } else {
@@ -587,7 +583,7 @@ public class SourceViewModel extends ViewModel {
             spThreadPool.execute(new Runnable() {
                 @Override
                 public void run() {
-                    ExecutorService executor = Executors.newSingleThreadExecutor();
+                    ExecutorService executor = spiderCallPool;
                     Future<String> future = executor.submit(new Callable<String>() {
                         @Override
                         public String call() throws Exception {
@@ -602,7 +598,6 @@ public class SourceViewModel extends ViewModel {
                     } catch (Throwable ignored) {
                         future.cancel(true);
                     } finally {
-                        executor.shutdown();
                         if (json != null) {
                             json(listResult, json, sourceBean.getKey());
                         } else {
@@ -679,7 +674,7 @@ public class SourceViewModel extends ViewModel {
             Runnable waitResponse = new Runnable() {
                 @Override
                 public void run() {
-                    ExecutorService executor = Executors.newSingleThreadExecutor();
+                    ExecutorService executor = spiderCallPool;
                     Future<String> future = executor.submit(new Callable<String>() {
                         @Override
                         public String call() throws Exception {
@@ -707,11 +702,6 @@ public class SourceViewModel extends ViewModel {
                             }
                         } else {
                             callback.done(null);
-                        }
-                        try {
-                            executor.shutdown();
-                        } catch (Throwable th) {
-                            th.printStackTrace();
                         }
                     }
                 }
@@ -794,7 +784,7 @@ public class SourceViewModel extends ViewModel {
             spThreadPool.execute(new Runnable() {
                 @Override
                 public void run() {
-                    ExecutorService executor = Executors.newSingleThreadExecutor();
+                    ExecutorService executor = spiderCallPool;
                     Future<String> future = executor.submit(new Callable<String>() {
                         @Override
                         public String call() {
@@ -822,7 +812,6 @@ public class SourceViewModel extends ViewModel {
                         LOG.i("echo--getDetail--error: " + e.getMessage());
                     } finally {
                         json(detailResult, json, sourceBean.getKey());
-                        executor.shutdown();
                     }
                 }
             });
@@ -1133,7 +1122,7 @@ public class SourceViewModel extends ViewModel {
             spThreadPool.execute(new Runnable() {
                 @Override
                 public void run() {
-                    ExecutorService executor = Executors.newSingleThreadExecutor();
+                    ExecutorService executor = spiderCallPool;
                     Future<String> future = executor.submit(new Callable<String>() {
                         @Override
                         public String call() throws Exception {
@@ -1178,8 +1167,6 @@ public class SourceViewModel extends ViewModel {
                         // 捕获其他异常
                         LOG.i("echo--getPlay--error: " + e.getMessage());
                         postPlayResult(requestSeq, null);
-                    } finally {
-                        executor.shutdown();
                     }
                 }
             });

@@ -211,12 +211,10 @@ public class FileUtils {
     }
 
     public static String read(String path) {
-        try {
-            BufferedReader br = new BufferedReader(new InputStreamReader(new FileInputStream(getLocal(path))));
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(new FileInputStream(getLocal(path)), "UTF-8"))) {
             StringBuilder sb = new StringBuilder();
             String text;
             while ((text = br.readLine()) != null) sb.append(text).append("\n");
-            br.close();
             return sb.toString();
         } catch (Exception e) {
             return "";
@@ -256,18 +254,25 @@ public class FileUtils {
     }
 
     public static void saveCache(File cache,String json){
+        File tmp = null;
         try {
             File cacheDir = cache.getParentFile();
             if (!cacheDir.exists())
                 cacheDir.mkdirs();
-            if (cache.exists())
-                cache.delete();
-            FileOutputStream fos = new FileOutputStream(cache);
-            fos.write(json.getBytes("UTF-8"));
-            fos.flush();
-            fos.close();
+            // 先写临时文件再原子替换，避免并发读到写了一半的缓存
+            tmp = new File(cache.getAbsolutePath() + ".tmp");
+            try (FileOutputStream fos = new FileOutputStream(tmp)) {
+                fos.write(json.getBytes("UTF-8"));
+                fos.flush();
+            }
+            if (cache.exists()) cache.delete();
+            if (!tmp.renameTo(cache)) {
+                copyFile(tmp, cache);
+                tmp.delete();
+            }
         } catch (Throwable th) {
             th.printStackTrace();
+            if (tmp != null && tmp.exists()) tmp.delete();
         }
     }
 

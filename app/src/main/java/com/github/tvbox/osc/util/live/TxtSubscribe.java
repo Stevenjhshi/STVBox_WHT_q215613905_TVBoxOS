@@ -9,6 +9,8 @@ import com.google.gson.JsonParser;
 import java.io.BufferedReader;
 import java.io.StringReader;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.regex.Matcher;
@@ -70,12 +72,16 @@ public class TxtSubscribe {
 
     private static JsonArray normalizeJsonArray(JsonArray groups) {
         JsonArray result = new JsonArray();
+        // channel 用哈希索引去重，避免大列表 O(n^2)
+        Map<JsonObject, Map<String, JsonObject>> channelIndexes = new IdentityHashMap<>();
         for (JsonElement groupElement : groups) {
             JsonObject groupObj = groupElement.getAsJsonObject();
             JsonObject outGroup = new JsonObject();
             String groupName = DefaultConfig.safeJsonString(groupObj, "group", "");
             if (groupName.isEmpty()) groupName = DefaultConfig.safeJsonString(groupObj, "name", DEFAULT_GROUP_NAME);
             outGroup.addProperty("group", normalizeGroupName(groupName));
+            Map<String, JsonObject> channelNameIndex = new HashMap<>();
+            channelIndexes.put(outGroup, channelNameIndex);
             JsonArray channels = null;
             if (groupObj.has("channels") && groupObj.get("channels").isJsonArray()) {
                 channels = groupObj.getAsJsonArray("channels");
@@ -103,7 +109,7 @@ public class TxtSubscribe {
                     copyIfExists(channelObj, outChannel, "catchup");
                     copyIfExists(channelObj, outChannel, "catchup-source");
                     copyIfExists(channelObj, outChannel, "catchup-replace");
-                    addChannel(outGroup, outChannel);
+                    addChannel(outGroup, channelNameIndex, outChannel);
                 }
             }
             if (!outGroup.has("channels")) outGroup.add("channels", new JsonArray());
@@ -118,10 +124,13 @@ public class TxtSubscribe {
 
     private static JsonArray parseM3uToJsonArray(String str) {
         JsonArray result = new JsonArray();
+        Map<String, JsonObject> groupIndex = new HashMap<>();
+        Map<JsonObject, Map<String, JsonObject>> channelIndexes = new IdentityHashMap<>();
         try {
             BufferedReader reader = new BufferedReader(new StringReader(str.replace("\r\n", "\n").replace("\r", "")));
             String line;
             JsonObject currentGroup = null;
+            Map<String, JsonObject> currentChannelIndex = null;
             JsonObject pendingChannel = null;
             JsonObject pendingMeta = new JsonObject();
             while ((line = reader.readLine()) != null) {
@@ -138,7 +147,8 @@ public class TxtSubscribe {
                 if (line.startsWith("#EXTINF") || line.contains("#EXTINF")) {
                     String groupName = get(line, GROUP_PATTERN);
                     groupName = normalizeGroupName(groupName);
-                    currentGroup = findOrCreateGroup(result, groupName);
+                    currentGroup = findOrCreateGroup(result, groupIndex, channelIndexes, groupName);
+                    currentChannelIndex = channelIndexes.get(currentGroup);
                     pendingChannel = new JsonObject();
                     pendingChannel.addProperty("name", get(line, NAME_PATTERN));
                     mergeMeta(pendingChannel, buildMeta(line));
@@ -147,7 +157,10 @@ public class TxtSubscribe {
                     continue;
                 }
                 if (line.startsWith("#")) continue;
-                if (currentGroup == null) currentGroup = findOrCreateGroup(result, DEFAULT_GROUP_NAME);
+                if (currentGroup == null) {
+                    currentGroup = findOrCreateGroup(result, groupIndex, channelIndexes, DEFAULT_GROUP_NAME);
+                    currentChannelIndex = channelIndexes.get(currentGroup);
+                }
                 if (pendingChannel == null) pendingChannel = new JsonObject();
                 String[] parts = line.split("\\|", 2);
                 String url = parts[0].trim();
@@ -157,7 +170,7 @@ public class TxtSubscribe {
                 JsonArray urls = pendingChannel.has("urls") ? pendingChannel.getAsJsonArray("urls") : new JsonArray();
                 if (!containsUrl(urls, url)) urls.add(url);
                 pendingChannel.add("urls", urls);
-                addChannel(currentGroup, pendingChannel);
+                addChannel(currentGroup, currentChannelIndex, pendingChannel);
                 pendingMeta = new JsonObject();
             }
             reader.close();
@@ -168,10 +181,13 @@ public class TxtSubscribe {
 
     private static JsonArray parseTxtToJsonArray(String str) {
         JsonArray result = new JsonArray();
+        Map<String, JsonObject> groupIndex = new HashMap<>();
+        Map<JsonObject, Map<String, JsonObject>> channelIndexes = new IdentityHashMap<>();
         try {
             BufferedReader reader = new BufferedReader(new StringReader(str.replace("\r\n", "\n").replace("\r", "")));
             String line;
             JsonObject currentGroup = null;
+            Map<String, JsonObject> currentChannelIndex = null;
             JsonObject pendingMeta = new JsonObject();
             while ((line = reader.readLine()) != null) {
                 line = line.trim();
@@ -182,13 +198,17 @@ public class TxtSubscribe {
                 }
                 if (line.contains("#genre#")) {
                     String groupName = line.split(",", 2)[0].trim();
-                    currentGroup = findOrCreateGroup(result, groupName);
+                    currentGroup = findOrCreateGroup(result, groupIndex, channelIndexes, groupName);
+                    currentChannelIndex = channelIndexes.get(currentGroup);
                     pendingMeta = new JsonObject();
                     continue;
                 }
                 String[] split = line.split(",", 2);
                 if (split.length < 2) continue;
-                if (currentGroup == null) currentGroup = findOrCreateGroup(result, DEFAULT_GROUP_NAME);
+                if (currentGroup == null) {
+                    currentGroup = findOrCreateGroup(result, groupIndex, channelIndexes, DEFAULT_GROUP_NAME);
+                    currentChannelIndex = channelIndexes.get(currentGroup);
+                }
                 JsonObject channel = new JsonObject();
                 channel.addProperty("name", split[0].trim());
                 mergeMeta(channel, pendingMeta);
@@ -201,7 +221,7 @@ public class TxtSubscribe {
                 JsonArray urlArray = new JsonArray();
                 for (String url : urls) urlArray.add(url);
                 channel.add("urls", urlArray);
-                addChannel(currentGroup, channel);
+                addChannel(currentGroup, currentChannelIndex, channel);
                 pendingMeta = new JsonObject();
             }
             reader.close();
@@ -223,16 +243,17 @@ public class TxtSubscribe {
         return wrapper;
     }
 
-    private static JsonObject findOrCreateGroup(JsonArray result, String name) {
+    private static JsonObject findOrCreateGroup(JsonArray result, Map<String, JsonObject> groupIndex,
+                                                Map<JsonObject, Map<String, JsonObject>> channelIndexes, String name) {
         name = normalizeGroupName(name);
-        for (JsonElement element : result) {
-            JsonObject group = element.getAsJsonObject();
-            if (name.equals(group.get("group").getAsString())) return group;
-        }
+        JsonObject cached = groupIndex.get(name);
+        if (cached != null) return cached;
         JsonObject group = new JsonObject();
         group.addProperty("group", name);
         group.add("channels", new JsonArray());
         result.add(group);
+        groupIndex.put(name, group);
+        channelIndexes.put(group, new HashMap<String, JsonObject>());
         return group;
     }
 
@@ -243,12 +264,13 @@ public class TxtSubscribe {
         return name;
     }
 
-    private static void addChannel(JsonObject group, JsonObject channel) {
+    private static void addChannel(JsonObject group, Map<String, JsonObject> channelIndex, JsonObject channel) {
         JsonArray channels = group.has("channels") ? group.getAsJsonArray("channels") : new JsonArray();
         String name = DefaultConfig.safeJsonString(channel, "name", "");
-        JsonObject exists = name.isEmpty() ? null : findChannel(channels, name);
+        JsonObject exists = name.isEmpty() ? null : (channelIndex == null ? findChannel(channels, name) : channelIndex.get(name));
         if (exists == null) {
             channels.add(channel);
+            if (channelIndex != null && !name.isEmpty()) channelIndex.put(name, channel);
         } else {
             mergeChannel(exists, channel);
         }

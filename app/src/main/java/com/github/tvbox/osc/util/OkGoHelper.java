@@ -185,6 +185,12 @@ public class OkGoHelper {
             e.printStackTrace();
         }
 
+        // DoH 关闭时直接使用系统 DNS，避免构建额外的 OkHttpClient 和 100MB 磁盘缓存
+        if (dohSelector == 0) {
+            dnsOverHttps = null;
+            return;
+        }
+
         OkHttpClient.Builder builder = new OkHttpClient.Builder();
         builder.proxySelector(proxySelector());
         builder.proxyAuthenticator(proxyAuthenticator());
@@ -202,7 +208,7 @@ public class OkGoHelper {
         } catch (Throwable th) {
             th.printStackTrace();
         }
-        builder.cache(new Cache(new File(App.getInstance().getCacheDir().getAbsolutePath(), "dohcache"), 100 * 1024 * 1024));
+        builder.cache(new Cache(new File(App.getInstance().getCacheDir().getAbsolutePath(), "dohcache"), 10 * 1024 * 1024));
         OkHttpClient dohClient = builder.build();
         String dohUrl = getDohUrl(Hawk.get(HawkConfig.DOH_URL, 0));
 //        if (!dohUrl.isEmpty()) is_doh = true;

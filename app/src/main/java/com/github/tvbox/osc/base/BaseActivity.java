@@ -277,8 +277,11 @@ public abstract class BaseActivity extends AppCompatActivity implements CustomAd
     protected static BitmapDrawable globalWp = null;
 
     public void changeWallpaper(boolean force) {
-        if (!force && globalWp != null)
+        if (!force && globalWp != null) {
+            // 已加载过壁纸，直接复用，避免每次 onResume 都重新解码图片
             getWindow().setBackgroundDrawable(globalWp);
+            return;
+        }
         try {
             File wp = new File(getFilesDir().getAbsolutePath() + "/wp");
             if (wp.exists()) {

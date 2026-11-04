@@ -32,6 +32,18 @@ import androidx.core.content.ContextCompat;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
+import java.io.File;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+
 import com.chad.library.adapter.base.BaseQuickAdapter;
 import com.github.catvod.crawler.Spider;
 import com.github.tvbox.osc.R;
@@ -59,8 +71,10 @@ import com.github.tvbox.osc.ui.tv.widget.ViewObj;
 import com.github.tvbox.osc.util.DefaultConfig;
 import com.github.tvbox.osc.util.EpgUtil;
 import com.github.tvbox.osc.util.FastClickCheckUtil;
+import com.github.tvbox.osc.util.FileUtils;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.LOG;
+import com.github.tvbox.osc.util.MD5;
 import com.github.tvbox.osc.util.OkGoHelper;
 import com.github.tvbox.osc.util.PlayerHelper;
 import com.github.tvbox.osc.util.HistoryHelper;
@@ -165,6 +179,18 @@ public class LivePlayActivity extends BaseActivity {
         }
     };
     private boolean firstLiveEpgLoad = true;
+
+    // 直播列表缓存：再次进入直播直接秒出，网络只在后台静默更新缓存
+    private static final long LIVE_LIST_CACHE_TTL = 30 * 60 * 1000L;
+    private static final ExecutorService LIVE_LIST_FETCH_EXECUTOR = Executors.newSingleThreadExecutor();
+    private static final ExecutorService LIVE_CONFIG_EXECUTOR = Executors.newSingleThreadExecutor();
+    private static final ExecutorService LIVE_SPIDER_EXECUTOR = Executors.newFixedThreadPool(2);
+    private static final ExecutorService LIVE_LIST_PARSE_EXECUTOR = Executors.newSingleThreadExecutor();
+    private static final ExecutorService EPG_PARSE_EXECUTOR = Executors.newSingleThreadExecutor();
+    private static final Object LIVE_LIST_PARSE_LOCK = new Object();
+    private final Set<String> liveListRefreshing = Collections.synchronizedSet(new HashSet<String>());
+    private String pendingLiveJar = "";
+    private boolean pendingLiveJarValid = false;
 
     private List<LiveChannelGroup> liveChannelGroupList = new ArrayList<>();
     private int currentLiveChannelIndex = -1;
@@ -654,14 +680,36 @@ public class LivePlayActivity extends BaseActivity {
                 } finally {
                     response.close();
                 }
-                mHandler.post(new Runnable() {
+                // EPG 报文可能很大，放到后台解析，避免解析时阻塞播放画面
+                EPG_PARSE_EXECUTOR.execute(new Runnable() {
                     @Override
                     public void run() {
-                        onEpgRequestResponse(body, date, channelNameReal, finalEpgTagName, savedEpgKey, epgQueryNames, timeFormat, queryIndex);
+                        final ArrayList<Epginfo> arrayList = parseEpgBody(body, finalEpgTagName, date);
+                        mHandler.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                onEpgRequestResponse(arrayList, date, channelNameReal, finalEpgTagName, savedEpgKey, epgQueryNames, timeFormat, queryIndex);
+                            }
+                        });
                     }
                 });
             }
         });
+    }
+
+    /** @return null 表示报文为空，否则为解析结果（可能为空列表） */
+    private ArrayList<Epginfo> parseEpgBody(String body, String finalEpgTagName, Date date) {
+        if (body == null || body.trim().isEmpty()) return null;
+        try {
+            if (isXmlEpgResponse(body)) {
+                return parseXmlEpg(body, finalEpgTagName, date);
+            } else if (body.contains("epg_data") || body.trim().startsWith("{")) {
+                return parseJsonEpg(body, date);
+            }
+        } catch (JSONException jSONException) {
+            jSONException.printStackTrace();
+        }
+        return new ArrayList<Epginfo>();
     }
 
     private void onEpgRequestFailure(Date date, String channelNameReal, String finalEpgTagName, String savedEpgKey,
@@ -678,25 +726,14 @@ public class LivePlayActivity extends BaseActivity {
 //        showBottomEpg();
     }
 
-    private void onEpgRequestResponse(String paramString, Date date, String channelNameReal, String finalEpgTagName,
+    private void onEpgRequestResponse(ArrayList<Epginfo> arrayList, Date date, String channelNameReal, String finalEpgTagName,
                                       String savedEpgKey, ArrayList<String> epgQueryNames, SimpleDateFormat timeFormat, int queryIndex) {
         if (!isCurrentEpgRequest(savedEpgKey)) return;
-        if (paramString == null || paramString.trim().isEmpty()) {
+        if (arrayList == null) {
             updateEpgPanelState(false);
             return;
         }
         LOG.i("echo-epgTagName:" + channelNameReal);
-        ArrayList<Epginfo> arrayList = new ArrayList<Epginfo>();
-        try {
-            if (isXmlEpgResponse(paramString)) {
-                arrayList = parseXmlEpg(paramString, finalEpgTagName, date);
-            } else if (paramString.contains("epg_data") || paramString.trim().startsWith("{")) {
-                arrayList = parseJsonEpg(paramString, date);
-            }
-
-        } catch (JSONException jSONException) {
-            jSONException.printStackTrace();
-        }
         if (arrayList.isEmpty() && requestNextEpgQueryName(date, channelNameReal, finalEpgTagName, savedEpgKey, epgQueryNames, timeFormat, queryIndex)) {
             return;
         }
@@ -1331,6 +1368,8 @@ public class LivePlayActivity extends BaseActivity {
     protected void onResume() {
         super.onResume();
         exitingLivePlay = false;
+        // 直播界面优先占用爬虫锁，后台搜索预热检测到该标记会主动让路
+        ApiConfig.livePlaybackActive = true;
         if (mVideoView != null) {
             mVideoView.resume();
         }
@@ -1348,6 +1387,7 @@ public class LivePlayActivity extends BaseActivity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        ApiConfig.livePlaybackActive = false;
         Hawk.put(HawkConfig.PLAYER_IS_LIVE, false);
         hideSwitchChannelSnapshot();
         if (mVideoView != null) {
@@ -1601,6 +1641,8 @@ public class LivePlayActivity extends BaseActivity {
     private void initLiveObj(){
         catchup = null;
         logoUrl = null;
+        pendingLiveJar = "";
+        pendingLiveJarValid = false;
         int position=ApiConfig.getLiveGroupIndex();
         JsonArray live_groups=Hawk.get(HawkConfig.LIVE_GROUP_LIST,new JsonArray());
         if (live_groups == null || live_groups.size() == 0 || position < 0 || position >= live_groups.size()) {
@@ -1633,7 +1675,8 @@ public class LivePlayActivity extends BaseActivity {
                 LOG.i("echo-ext:"+ext);
                 if(!ext.isEmpty())py_jar=py_jar+"?extend="+ext;
             }
-            ApiConfig.get().setLiveJar(py_jar);
+            pendingLiveJar = py_jar;
+            pendingLiveJarValid = true;
         }
     }
 
@@ -2690,13 +2733,27 @@ public class LivePlayActivity extends BaseActivity {
                 JsonObject livesOBJ = live_groups.get(position).getAsJsonObject();
                 liveSettingItemAdapter.selectItem(position, true, true);
                 ApiConfig.setLiveGroupIndex(position);
-                ApiConfig.get().loadLiveApi(livesOBJ);
-                if (ApiConfig.get().getChannelGroupList().isEmpty()) {
-                    if (mVideoView != null) mVideoView.release();
-                    setEmptyLiveChannelList(false);
-                    break;
-                }
-                refreshLiveChannelListAndPlay(currentChannelName, currentSourceIndex);
+                final int requestId = liveConfigRequestId;
+                // loadLiveApi 对 py/js 源会拉取脚本，必须离开主线程否则切换卡顿/ANR
+                LIVE_CONFIG_EXECUTOR.execute(new Runnable() {
+                    @Override
+                    public void run() {
+                        ApiConfig.get().loadLiveApi(livesOBJ);
+                        final boolean empty = ApiConfig.get().getChannelGroupList().isEmpty();
+                        mHandler.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                if (requestId != liveConfigRequestId || isFinishing()) return;
+                                if (empty) {
+                                    if (mVideoView != null) mVideoView.release();
+                                    setEmptyLiveChannelList(false);
+                                    return;
+                                }
+                                refreshLiveChannelListAndPlay(currentChannelName, currentSourceIndex);
+                            }
+                        });
+                    }
+                });
                 break;
             case 6: {//配置切换
                 ArrayList<String> history = Hawk.get(HawkConfig.LIVE_API_HISTORY, new ArrayList<String>());
@@ -2878,71 +2935,84 @@ public class LivePlayActivity extends BaseActivity {
 
         LOG.i("echo-live-url:"+url);
 
-        if(url.contains(".py") || url.contains(".js")){
-            String finalUrl = url;
-            Runnable waitResponse = new Runnable() {
+        final String liveUrl = url;
+        final File cacheFile = liveListCacheFile(liveUrl);
+        // 用户手动切换直播源时强制走网络；日常进入直播优先秒出本地缓存
+        if (!refreshingLiveChannelList && cacheFile.exists() && cacheFile.length() > 0) {
+            LIVE_LIST_PARSE_EXECUTOR.execute(new Runnable() {
                 @Override
                 public void run() {
-                    ExecutorService executor = Executors.newSingleThreadExecutor();
-                    Future<String> future = executor.submit(new Callable<String>() {
+                    String cached = readLiveListCache(cacheFile);
+                    if (TextUtils.isEmpty(cached)) {
+                        fetchLiveList(liveUrl, true, cacheFile);
+                        return;
+                    }
+                    parseAndApplyLiveList(cached);
+                    // 缓存过期时静默更新，仅用于下次进入，不打断当前播放
+                    if (System.currentTimeMillis() - cacheFile.lastModified() > LIVE_LIST_CACHE_TTL) {
+                        fetchLiveList(liveUrl, false, cacheFile);
+                    }
+                }
+            });
+            return;
+        }
+        if (!refreshingLiveChannelList) {
+            showLoading();
+        }
+        fetchLiveList(liveUrl, true, cacheFile);
+    }
+
+    private File liveListCacheFile(String url) {
+        File dir = new File(getCacheDir(), "live_list");
+        if (!dir.exists()) dir.mkdirs();
+        return new File(dir, MD5.string2MD5(url) + ".cache");
+    }
+
+    private String readLiveListCache(File cacheFile) {
+        try {
+            String content = FileUtils.read(cacheFile.getAbsolutePath());
+            return TextUtils.isEmpty(content) ? null : content;
+        } catch (Throwable th) {
+            th.printStackTrace();
+            return null;
+        }
+    }
+
+    private void fetchLiveList(final String url, final boolean apply, final File cacheFile) {
+        // 静默刷新去重，避免同一地址重复请求
+        if (!apply && !liveListRefreshing.add(url)) return;
+        if (url.contains(".py") || url.contains(".js")) {
+            LIVE_LIST_FETCH_EXECUTOR.execute(new Runnable() {
+                @Override
+                public void run() {
+                    Future<String> future = LIVE_SPIDER_EXECUTOR.submit(new Callable<String>() {
                         @Override
                         public String call() {
-                            Spider sp = ApiConfig.get().getLiveCSP(finalUrl);
-                            String json=sp.liveContent(finalUrl);
-//                            LOG.i("echo--loadProxyLives-json--"+json);
-                            return json;
+                            if (pendingLiveJarValid) ApiConfig.get().setLiveJar(pendingLiveJar);
+                            Spider sp = ApiConfig.get().getLiveCSP(url);
+                            return sp.liveContent(url);
                         }
                     });
-                    String sortJson = null;
+                    String content = null;
                     try {
-                        sortJson = future.get(ApiConfig.get().getLiveConnectTimeoutSeconds(), TimeUnit.SECONDS);
+                        content = future.get(ApiConfig.get().getLiveConnectTimeoutSeconds(), TimeUnit.SECONDS);
                     } catch (TimeoutException e) {
                         e.printStackTrace();
                         future.cancel(true);
                     } catch (InterruptedException | ExecutionException e) {
                         e.printStackTrace();
                     } finally {
-                        if (sortJson==null || sortJson.isEmpty()) {
-                            // 频道列表为空时，使用默认播放列表
-                            mHandler.post(new Runnable() {
-                                @Override
-                                public void run() {
-                                    setEmptyLiveChannelList();
-                                }
-                            });
-                            return;
-                        }
-                        JsonArray livesArray = TxtSubscribe.parseToJsonArray(sortJson);
-
-                        ApiConfig.get().loadLives(livesArray);
-                        List<LiveChannelGroup> list = ApiConfig.get().getChannelGroupList();
-                        if (list.isEmpty()) {
-                            mHandler.post(new Runnable() {
-                                @Override
-                                public void run() {
-                                    setEmptyLiveChannelList();
-                                }
-                            });
-                            return;
-                        }
-                        final ArrayList<LiveChannelGroup> loadedGroups = new ArrayList<>(list);
-
-                        mHandler.post(new Runnable() {
-                            @Override
-                            public void run() {
-                                applyLiveChannelGroups(loadedGroups);
-                            }
-                        });
-                        try {
-                            executor.shutdown();
-                        } catch (Throwable th) {
-                            th.printStackTrace();
-                        }
+                        liveListRefreshing.remove(url);
                     }
+                    if (TextUtils.isEmpty(content)) {
+                        if (apply) applyLiveListCacheOrEmpty(cacheFile);
+                        return;
+                    }
+                    FileUtils.saveCache(cacheFile, content);
+                    if (apply) parseAndApplyLiveList(content);
                 }
-            };
-            Executors.newSingleThreadExecutor().execute(waitResponse);
-        }else {
+            });
+        } else {
             OkGo.<String>get(url).execute(new AbsCallback<String>() {
 
                 @Override
@@ -2953,40 +3023,81 @@ public class LivePlayActivity extends BaseActivity {
 
                 @Override
                 public void onSuccess(Response<String> response) {
-                    JsonArray livesArray = TxtSubscribe.parseToJsonArray(response.body());
-
-                    ApiConfig.get().loadLives(livesArray);
-                    List<LiveChannelGroup> list = ApiConfig.get().getChannelGroupList();
-                    if (list.isEmpty()) {
-                        mHandler.post(new Runnable() {
-                            @Override
-                            public void run() {
-                                setEmptyLiveChannelList();
-                            }
-                        });
-                        return;
-                    }
-                    final ArrayList<LiveChannelGroup> loadedGroups = new ArrayList<>(list);
-
-                    mHandler.post(new Runnable() {
+                    final String content = response.body();
+                    // 解析与落盘放到后台线程，避免在 UI 线程处理大列表造成卡顿
+                    LIVE_LIST_PARSE_EXECUTOR.execute(new Runnable() {
                         @Override
                         public void run() {
-                            applyLiveChannelGroups(loadedGroups);
+                            liveListRefreshing.remove(url);
+                            if (TextUtils.isEmpty(content)) {
+                                if (apply) applyLiveListCacheOrEmpty(cacheFile);
+                                return;
+                            }
+                            FileUtils.saveCache(cacheFile, content);
+                            if (apply) parseAndApplyLiveList(content);
                         }
                     });
                 }
 
                 @Override
                 public void onError(Response<String> response) {
-                    mHandler.post(new Runnable() {
-                        @Override
-                        public void run() {
-                            setEmptyLiveChannelList();
-                        }
-                    });
+                    liveListRefreshing.remove(url);
+                    if (apply) {
+                        LIVE_LIST_PARSE_EXECUTOR.execute(new Runnable() {
+                            @Override
+                            public void run() {
+                                applyLiveListCacheOrEmpty(cacheFile);
+                            }
+                        });
+                    }
                 }
             });
         }
+    }
+
+    /** 网络失败时优先使用本地缓存，缓存也没有才展示空列表 */
+    private void applyLiveListCacheOrEmpty(File cacheFile) {
+        String cached = readLiveListCache(cacheFile);
+        if (TextUtils.isEmpty(cached)) {
+            postEmptyLiveChannelList();
+        } else {
+            parseAndApplyLiveList(cached);
+        }
+    }
+
+    /** 必须在后台线程执行：解析 + 构建频道树 + 回到主线程应用 */
+    private void parseAndApplyLiveList(String content) {
+        ArrayList<LiveChannelGroup> loadedGroups = null;
+        try {
+            JsonArray livesArray = TxtSubscribe.parseToJsonArray(content);
+            synchronized (LIVE_LIST_PARSE_LOCK) {
+                ApiConfig.get().loadLives(livesArray);
+                List<LiveChannelGroup> list = ApiConfig.get().getChannelGroupList();
+                if (!list.isEmpty()) loadedGroups = new ArrayList<>(list);
+            }
+        } catch (Throwable th) {
+            th.printStackTrace();
+        }
+        final ArrayList<LiveChannelGroup> result = loadedGroups;
+        mHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                if (result == null) {
+                    setEmptyLiveChannelList();
+                } else {
+                    applyLiveChannelGroups(result);
+                }
+            }
+        });
+    }
+
+    private void postEmptyLiveChannelList() {
+        mHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                setEmptyLiveChannelList();
+            }
+        });
     }
 
     private boolean isValidLiveProxyUrl(String url) {

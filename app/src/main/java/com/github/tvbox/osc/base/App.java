@@ -21,6 +21,9 @@ import com.p2p.P2PClass;
 import com.whl.quickjs.android.QuickJSLoader;
 import com.github.catvod.crawler.JsLoader;
 
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
 import me.jessyan.autosize.AutoSizeConfig;
 import me.jessyan.autosize.unit.Subunits;
 
@@ -31,6 +34,8 @@ import me.jessyan.autosize.unit.Subunits;
  */
 public class App extends MultiDexApplication {
     private static App instance;
+    // 启动阶段可延后的初始化，避免占用主线程
+    private static final ExecutorService STARTUP_EXECUTOR = Executors.newFixedThreadPool(2);
 
     private static P2PClass p;
     public static String burl;
@@ -43,7 +48,6 @@ public class App extends MultiDexApplication {
         initParams();
         // OKGo
         OkGoHelper.init(); //台标获取
-        EpgUtil.init();
         // 初始化Web服务器
         ControlManager.init(this);
         //初始化数据库
@@ -56,9 +60,26 @@ public class App extends MultiDexApplication {
                 .setSupportDP(false)
                 .setSupportSP(false)
                 .setSupportSubunits(Subunits.MM);
-        PlayerHelper.init();
+        // 以下初始化不必阻塞首屏：放到后台并行完成
+        STARTUP_EXECUTOR.execute(new Runnable() {
+            @Override
+            public void run() {
+                EpgUtil.init();
+            }
+        });
+        STARTUP_EXECUTOR.execute(new Runnable() {
+            @Override
+            public void run() {
+                PlayerHelper.init();
+            }
+        });
+        STARTUP_EXECUTOR.execute(new Runnable() {
+            @Override
+            public void run() {
+                FileUtils.cleanPlayerCache();
+            }
+        });
         QuickJSLoader.init();
-        FileUtils.cleanPlayerCache();
     }
 
     private void initParams() {
