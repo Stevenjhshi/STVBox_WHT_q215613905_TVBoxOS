@@ -2764,7 +2764,7 @@ public class LivePlayActivity extends BaseActivity {
                 int configSourceIndex = getPreferredLiveRefreshSourceIndex();
                 liveSettingItemAdapter.selectItem(position, true, true);
                 if (value.equals(oldLiveApi)) break;
-                final int requestId = ++liveConfigRequestId;
+                final int configSwitchRequestId = ++liveConfigRequestId;
                 Hawk.put(HawkConfig.LIVE_API_URL, value);
                 HistoryHelper.setLiveApiHistory(value);
                 ApiConfig.get().refreshLiveApiHistoryItems();
@@ -2774,7 +2774,7 @@ public class LivePlayActivity extends BaseActivity {
                         mHandler.post(new Runnable() {
                             @Override
                             public void run() {
-                                if (requestId != liveConfigRequestId || isFinishing()) return;
+                                if (configSwitchRequestId != liveConfigRequestId || isFinishing()) return;
                                 refreshLiveChannelListAndPlay(configChannelName, configSourceIndex);
                             }
                         });
@@ -2785,7 +2785,7 @@ public class LivePlayActivity extends BaseActivity {
                         mHandler.post(new Runnable() {
                             @Override
                             public void run() {
-                                if (requestId != liveConfigRequestId || isFinishing()) return;
+                                if (configSwitchRequestId != liveConfigRequestId || isFinishing()) return;
                                 if (mVideoView != null) mVideoView.release();
                                 ApiConfig.get().refreshLiveApiHistoryItems();
                                 setEmptyLiveChannelList(false);
@@ -2799,7 +2799,7 @@ public class LivePlayActivity extends BaseActivity {
                         mHandler.post(new Runnable() {
                             @Override
                             public void run() {
-                                if (requestId != liveConfigRequestId || isFinishing()) return;
+                                if (configSwitchRequestId != liveConfigRequestId || isFinishing()) return;
                                 Toast.makeText(LivePlayActivity.this, msg, Toast.LENGTH_SHORT).show();
                             }
                         });
